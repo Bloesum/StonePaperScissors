@@ -35,9 +35,9 @@ contract StonePaperScissors {
     
     function onboardGame () public payable {
         require(msg.value > 1000, "bet too low to start game");
-        require(players.length  < 2, "Only two person can take part in this games");
+        require(players.length  < 3, "Only two person can take part in this games");
         if (amount > 0) {
-            require(msg.value >= amount, "Bet should be at least the amount of other player");
+            require(msg.value == amount, "Bet should be at least the amount of other player");
         }
         emit logOnBoarding(msg.sender, msg.value);
         players.push(msg.sender);
