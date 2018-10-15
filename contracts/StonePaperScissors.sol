@@ -1,113 +1,211 @@
 pragma solidity 0.4.24;
 
-contract StonePaperScissors {
+contract Casino {
     
-    //RULES OF THE GAME:
-    //2 players play one game with multiple sets. Each player onboard with minimum fo 1000 Wei
-    //Player with best of 3 sets wins games.C hoices: 1 = stone, 2 = scissors and 3 = paper
-    
-    struct Choice {
-        bytes32 hash;
-        int8 stonePaperScissorsChoice;
+    struct Player {
+        uint total;
+        bool isCheckedIn;
+        address[] gameID;
     }
     
-    mapping (address => Choice) public choices;
-    address[] public players;
-    uint public choiceCount;
-    uint public revealCount;
-    uint public amount;
-    uint public setsPlayer1;
-    uint public setsPlayer2;
-    address public winner;
+    mapping (address => Player) public Players;
     
-    event logOnBoarding(address indexed _player, uint indexed _amount);
-    event logCommitChoice(address indexed _player);
-    event logRevealChoice(address indexed _player);
-    event logGetWinnerGame(address indexed _winner);
-    event logGetPrice(address indexed _winner, uint indexed _amount);
-    
-    constructor () public {
+    struct Game {
+        uint wager;
+        bytes32 secret;
+        bool gameEnded;
+        bool active;
     }
     
-    function hashHelper(string password, address sender, int8 stonePaperScissorsChoice) public pure returns(bytes32 hashPass) {
-        return keccak256(abi.encodePacked(password, sender, stonePaperScissorsChoice));
+    mapping (address => Game) public Games;
+    
+    event logCheckIn(address indexed player, uint indexed amount);
+    event logCheckOut(address indexed player, uint indexed amount);
+    event logStartTable(address indexed player, uint indexed wager, bytes32 secret);
+    
+    BlackListInterface blI;
+
+    constructor(address blacklist) public {
+        blI = BlackListInterface(blacklist);
     }
     
-    function onboardGame () public payable {
-        require(msg.value > 1000, "bet too low to start game");
-        require(players.length  < 3, "Only two person can take part in this games");
-        if (amount > 0) {
-            require(msg.value == amount, "Bet should be at least the amount of other player");
-        }
-        emit logOnBoarding(msg.sender, msg.value);
-        players.push(msg.sender);
-        amount += msg.value;
-    }
-    
-    modifier onlyStartedGame() {
-        require(players.length == 2, "Game must start with 2 players");
-        require((setsPlayer1 + setsPlayer2) < 3, "Game ends after 3 sets");
+    modifier notBlackListed() {
+        require(!blI.isBlackListed(msg.sender));
         _;
     }
     
-    function commitChoice (bytes32 _hash) public onlyStartedGame {
-        //committer should first hash his password, adres and choice offchain
-        require(players[0] == msg.sender || players[1] == msg.sender, "Player not yet onboarded");
-        require(choiceCount < 2, "A set only needs 2 choices");
-        require(choices[msg.sender].hash == "", "user already sent a choice");
-        choices[msg.sender].hash = _hash;
-        choiceCount ++;
-        emit logCommitChoice(msg.sender);
+    function checkIn() public notBlackListed payable returns (bool success) {
+        require(!isPlayer(msg.sender), "Player is already checked in" );
+        Players[msg.sender].total = msg.value;
+        Players[msg.sender].isCheckedIn = true;
+        emit logCheckIn(msg.sender, msg.value);
+        return true;
     }
     
-    function revealChoice (string _password, int8 _stonePaperScissorsChoice) public onlyStartedGame {
-        require(choiceCount > 1, "Second person has not voted yet");
-        require(hashHelper(_password, msg.sender, _stonePaperScissorsChoice) == choices[msg.sender].hash, "Reveal does not equal commit");
-        choices[msg.sender].stonePaperScissorsChoice = _stonePaperScissorsChoice;
-        revealCount ++;
-        choices[msg.sender].hash = "";
-        emit logRevealChoice(msg.sender);
-        if (revealCount == 2) {
-            getWinnerSet();
+    function checkOut() public {
+        require(isPlayer(msg.sender), "Player not checked in");
+        //Close all open games this player started
+        for (uint i = 0; i < Players[msg.sender].gameID.length; i++) {
+            address thisGame = Players[msg.sender].gameID[i];
+            if (Games[thisGame].gameEnded == false) {
+                Games[thisGame].gameEnded = true;
+                uint wager2 = Games[thisGame].wager; //Is this ok?
+                Games[thisGame].wager = 0;
+                TableGame(thisGame).cleanUp();
+                Players[msg.sender].total += wager2;
+            }
+        }
+        uint withdraw = Players[msg.sender].total;
+        Players[msg.sender].total = 0;
+        emit logCheckOut(msg.sender, withdraw);
+        msg.sender.transfer(withdraw);
+    }
+    
+    function isPlayer(address player) public view returns (bool isIndeed) {
+        return Players[player].isCheckedIn;
+    }
+    
+    function getGame(address player, address game) internal view returns (bool success) {
+        for (uint i = 0; i < Players[player].gameID.length; i++) {
+            address thisGame = Players[msg.sender].gameID[i];
+            if (thisGame == game) {
+                return true;
+            }
         }
     }
     
-    function getWinnerSet () internal {
-        int8 spsDiff = choices[players[0]].stonePaperScissorsChoice - choices[players[1]].stonePaperScissorsChoice;
-        if (spsDiff == -1 || spsDiff == 2) {
-            setsPlayer1 ++;
-        } else if (spsDiff == 1 || spsDiff == -2) {
-            setsPlayer2 ++;
+    function startGame(uint wager, bytes32 _secret) public returns (address newTable) {
+        require(isPlayer(msg.sender), "Player not checked in");
+        require(Players[msg.sender].total >= wager, "Can't bet more money then you own");
+        //Check reuse secrets
+        for (uint i = 0; i < Players[msg.sender].gameID.length; i++) {
+            address thisGame = Players[msg.sender].gameID[i];
+            if (Games[thisGame].secret == _secret) {
+                revert("Choose a new secret!");
+            }
         }
-        choiceCount = 0;
-        revealCount = 0;
-        if (((setsPlayer1 + setsPlayer2) == 3) || (setsPlayer1 == 2) || (setsPlayer2 == 2)) {
-            getWinnerGame();
-        }
+        
+        TableGame tablegame = new TableGame(msg.sender, _secret, wager);
+        Players[msg.sender].total -= wager;
+        Players[msg.sender].gameID.push(address(tablegame)); //becomes owner
+        Games[address(tablegame)].gameEnded = false;
+        Games[address(tablegame)].wager = wager;
+        Games[address(tablegame)].active = true;
+        Games[address(tablegame)].secret = _secret;
+        emit logStartTable(msg.sender, wager, _secret);
+        return address(tablegame);
     }
     
-    function getWinnerGame () internal {
-        if (setsPlayer1 > setsPlayer2) {
-            winner = players[0];
-        } else {
-            winner = players[1];
-        }
-        emit logGetWinnerGame(winner);
-        delete players;
+    function addToBalance(address player, uint amount, address game) public returns (bool success) {
+        require(getGame(msg.sender, game) || Games[msg.sender].active, "No existing combination");
+        Players[player].total += amount;
+        return true;
     }
     
-    function getPrice () public {
+    function substractFromBalance(address player, uint amount, address game) public returns (bool success) {
+        require(getGame(msg.sender, game), "No existing combination");
+        Players[player].total -= amount;
+        return true;
+    }
+    
+    function setStatusGame(address game) public returns (bool success) {
+        require(getGame(msg.sender, game), "No existing combination");
+        Games[game].gameEnded = true;
+        return true;
+    }
+}
+
+contract BlackListInterface { //Just for the fun of it
+    
+    mapping(address => bool) public isBlackListed;
+    function blacklistPlayer(address badPlayer) public returns (bool success);
+}
+
+contract BlackList is BlackListInterface {
+    
+    mapping(address => bool) public isBlackListed;
+    
+    event logBlacklistPlayer(address indexed player);
+    
+    function blacklistPlayer(address badPlayer) public returns (bool success) {
+        require(!isBlackListed[badPlayer]);
+        isBlackListed[badPlayer] = true;
+        emit logBlacklistPlayer(badPlayer);
+        return true;
+    }
+}
+
+contract TableGame {
+    
+    uint public amount;
+    address public owner;
+    bool public gameEnded;
+    bytes32 public secret;
+    int8 public choice2;
+    address public firstPlayer;
+    address public secondPlayer;
+    address public winner;
+    address public looser;
+    
+    event logCleanUp(address indexed firstPlayer, uint indexed amount);
+    event logJoinGame(address indexed secondPlayer, int8 choice);
+    event logfinishGame(address indexed winner, uint indexed amount, bool indexed draw);
+    
+    constructor(address _player, bytes32 _secret, uint _amount) public { //First move
+        amount = _amount;
+        owner = msg.sender;
+        gameEnded = false;
+        secret = _secret;
+        firstPlayer = _player;
+    }
+    
+    function cleanUp() public returns (bool success) {
+        require(msg.sender == owner, "You are not the owner to clean up");
+        require(gameEnded == false, "Game is already won");
         uint amount2 = amount;
-        address winner2 = winner;
-        require(winner != 0, "Price already paid");
-        delete winner;
-        delete amount;
-        delete choiceCount;
-        delete revealCount;
-        delete setsPlayer1;
-        delete setsPlayer2;
-        emit logGetPrice(winner2, amount2);
-        winner2.transfer(amount2);
+        amount = 0;
+        gameEnded = true;
+        emit logCleanUp(firstPlayer, amount2);
+        Casino(owner).addToBalance(firstPlayer, amount, address(this));
+        return true;
     }
     
+    function hashHelper(string password, address sender, int8 stonePaperScissorsChoice) public pure returns(bytes32 hashPass) {
+        return keccak256(abi.encodePacked(password,sender, stonePaperScissorsChoice));
+    }
+    
+    function joinGame(int8 _choice, uint wager) public returns (bool success) {
+        require(wager == amount, "You should bet as much as challenger");
+        amount += wager;
+        choice2 = _choice;
+        secondPlayer = msg.sender;
+        emit logJoinGame(secondPlayer, _choice);
+        Casino(owner).substractFromBalance(secondPlayer, wager, address(this));
+        return true;
+    }
+    
+    function finishGame (string _password, int8 _stonePaperScissorsChoice) public returns (bool success) {
+        require(_stonePaperScissorsChoice != 0, "second player has not made a choice yet");
+        require(hashHelper(_password, msg.sender, _stonePaperScissorsChoice) == secret, "Reveal does not equal commit");
+        gameEnded = true;
+        uint amount2;
+        amount2 = amount;
+        amount = 0;
+        int8 spsDiff = _stonePaperScissorsChoice - choice2;
+        if (spsDiff == -1 || spsDiff == 2) {
+            winner = firstPlayer;
+        } else if (spsDiff == 1 || spsDiff == -2) {
+            winner = secondPlayer;
+        } else {
+            emit logfinishGame(0, 0, true);
+            Casino(owner).setStatusGame(address(this));
+            Casino(owner).addToBalance(firstPlayer, amount2 / 2, address(this));
+            Casino(owner).addToBalance(secondPlayer, amount2 / 2, address(this));
+            return true;
+        }
+        emit logfinishGame(winner, amount, false);
+        Casino(owner).addToBalance(winner, amount2, address(this));
+        Casino(owner).setStatusGame(address(this));
+        return true;
+    }
 }
